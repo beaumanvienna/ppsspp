@@ -77,7 +77,7 @@ enum {
 	TRANSFORMED_VERTEX_BUFFER_SIZE = VERTEX_BUFFER_MAX * sizeof(TransformedVertex)
 };
 
-#define QUAD_INDICES_MAX 32768
+#define QUAD_INDICES_MAX 65536
 
 #define VERTEXCACHE_DECIMATION_INTERVAL 17
 
@@ -113,14 +113,6 @@ TransformDrawEngineDX9::TransformDrawEngineDX9()
 	transformedExpanded = (TransformedVertex *)AllocateMemoryPages(3 * TRANSFORMED_VERTEX_BUFFER_SIZE);
 
 	quadIndices_ = new u16[6 * QUAD_INDICES_MAX];
-	for (int i = 0; i < QUAD_INDICES_MAX; i++) {
-		quadIndices_[i * 6 + 0] = i * 4;
-		quadIndices_[i * 6 + 1] = i * 4 + 2;
-		quadIndices_[i * 6 + 2] = i * 4 + 1;
-		quadIndices_[i * 6 + 3] = i * 4 + 1;
-		quadIndices_[i * 6 + 4] = i * 4 + 2;
-		quadIndices_[i * 6 + 5] = i * 4 + 3;
-	}
 
 	if (g_Config.bPrescaleUV) {
 		uvScale = new UVScale[MAX_DEFERRED_DRAW_CALLS];
@@ -301,7 +293,7 @@ void TransformDrawEngineDX9::SubmitPrim(void *verts, void *inds, GEPrimitiveType
 
 	// TODO: Is this the right thing to do?
 	if (prim == GE_PRIM_KEEP_PREVIOUS) {
-		prim = prevPrim_;
+		prim = prevPrim_ != GE_PRIM_INVALID ? prevPrim_ : GE_PRIM_POINTS;
 	} else {
 		prevPrim_ = prim;
 	}
@@ -462,7 +454,7 @@ inline u32 ComputeMiniHashRange(const void *ptr, size_t sz) {
 		size_t step = sz / 4;
 		u32 hash = 0;
 		for (size_t i = 0; i < sz; i += step) {
-			hash += DoReliableHash(p + i, 100, 0x3A44B9C4);
+			hash += DoReliableHash32(p + i, 100, 0x3A44B9C4);
 		}
 		return hash;
 	} else {
@@ -509,8 +501,8 @@ void TransformDrawEngineDX9::MarkUnreliable(VertexArrayInfoDX9 *vai) {
 	}
 }
 
-u32 TransformDrawEngineDX9::ComputeHash() {
-	u32 fullhash = 0;
+ReliableHashType TransformDrawEngineDX9::ComputeHash() {
+	ReliableHashType fullhash = 0;
 	const int vertexSize = dec_->GetDecVtxFmt().stride;
 	const int indexSize = (dec_->VertexType() & GE_VTYPE_IDX_MASK) == GE_VTYPE_IDX_16BIT ? 2 : 1;
 
@@ -645,7 +637,7 @@ void TransformDrawEngineDX9::DoFlush() {
 			case VertexArrayInfoDX9::VAI_NEW:
 				{
 					// Haven't seen this one before.
-					u32 dataHash = ComputeHash();
+					ReliableHashType dataHash = ComputeHash();
 					vai->hash = dataHash;
 					vai->minihash = ComputeMiniHash();
 					vai->status = VertexArrayInfoDX9::VAI_HASHING;
@@ -670,7 +662,7 @@ void TransformDrawEngineDX9::DoFlush() {
 					if (vai->drawsUntilNextFullHash == 0) {
 						// Let's try to skip a full hash if mini would fail.
 						const u32 newMiniHash = ComputeMiniHash();
-						u32 newHash = vai->hash;
+						ReliableHashType newHash = vai->hash;
 						if (newMiniHash == vai->minihash) {
 							newHash = ComputeHash();
 						}
@@ -786,7 +778,7 @@ rotateVBO:
 			prim = indexGen.Prim();
 		}
 
-		DEBUG_LOG(G3D, "Flush prim %i! %i verts in one go", prim, vertexCount);
+		VERBOSE_LOG(G3D, "Flush prim %i! %i verts in one go", prim, vertexCount);
 		bool hasColor = (lastVType_ & GE_VTYPE_COL_MASK) != GE_VTYPE_COL_NONE;
 		if (gstate.isModeThrough()) {
 			gstate_c.vertexFullAlpha = gstate_c.vertexFullAlpha && (hasColor || gstate.getMaterialAmbientA() == 255);
@@ -830,7 +822,7 @@ rotateVBO:
 		// Undo the strip optimization, not supported by the SW code yet.
 		if (prim == GE_PRIM_TRIANGLE_STRIP)
 			prim = GE_PRIM_TRIANGLES;
-		DEBUG_LOG(G3D, "Flush prim %i SW! %i verts in one go", prim, indexGen.VertexCount());
+		VERBOSE_LOG(G3D, "Flush prim %i SW! %i verts in one go", prim, indexGen.VertexCount());
 
 		int numTrans = 0;
 		bool drawIndexed = false;

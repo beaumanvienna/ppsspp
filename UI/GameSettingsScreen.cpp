@@ -44,21 +44,25 @@
 #include "Core/Host.h"
 #include "Core/System.h"
 #include "Core/Reporting.h"
-#include "Core/MIPS/JitCommon/JitCommon.h"
 #include "android/jni/TestRunner.h"
 #include "GPU/GPUInterface.h"
 #include "GPU/GLES/Framebuffer.h"
 
 #if defined(_WIN32)
 #include "Windows/WndMainWindow.h"
+#include <shlobj.h>
+#include "util/text/utf8.h"
+#include "Windows/W32Util/ShellUtil.h"
+using namespace std;
+
 #endif
 
 #ifdef IOS
 extern bool iosCanUseJit;
 #endif
 
-GameSettingsScreen::GameSettingsScreen(std::string gamePath, std::string gameID)
-	: UIDialogScreenWithGameBackground(gamePath), gameID_(gameID), enableReports_(false) {
+GameSettingsScreen::GameSettingsScreen(std::string gamePath, std::string gameID, bool editThenRestore)
+	: UIDialogScreenWithGameBackground(gamePath), gameID_(gameID), enableReports_(false), bEditThenRestore(editThenRestore) {
 	lastVertical_ = UseVerticalLayout();
 }
 
@@ -68,6 +72,12 @@ bool GameSettingsScreen::UseVerticalLayout() const {
 
 void GameSettingsScreen::CreateViews() {
 	GameInfo *info = g_gameInfoCache.GetInfo(NULL, gamePath_, GAMEINFO_WANTBG | GAMEINFO_WANTSIZE);
+
+	if (bEditThenRestore)
+	{
+		g_Config.changeGameSpecific(gameID_);
+		g_Config.loadGameConfig(gameID_);
+	}
 
 	cap60FPS_ = g_Config.iForceMaxEmulatedFPS == 60;
 
@@ -85,6 +95,7 @@ void GameSettingsScreen::CreateViews() {
 	I18NCategory *c = GetI18NCategory("Controls");
 	I18NCategory *a = GetI18NCategory("Audio");
 	I18NCategory *s = GetI18NCategory("System");
+	I18NCategory *n = GetI18NCategory("System");  // Networking used to be in System - TODO: Move the translations.. (ugh)
 	I18NCategory *ms = GetI18NCategory("MainSettings");
 	I18NCategory *dev = GetI18NCategory("Developer");
 
@@ -273,6 +284,9 @@ void GameSettingsScreen::CreateViews() {
 	CheckBox *prescale = graphicsSettings->Add(new CheckBox(&g_Config.bPrescaleUV, gs->T("Texture Coord Speedhack")));
 	prescale->SetDisabledPtr(&g_Config.bSoftwareRendering);
 
+	CheckBox *depthRange = graphicsSettings->Add(new CheckBox(&g_Config.bDepthRangeHack, gs->T("Depth Range Hack (Phantasy Star Portable 2)")));
+	depthRange->SetDisabledPtr(&g_Config.bSoftwareRendering);
+
 	graphicsSettings->Add(new ItemHeader(gs->T("Overlay Information")));
 	static const char *fpsChoices[] = {
 		"None", "Speed", "FPS", "Both"
@@ -293,7 +307,7 @@ void GameSettingsScreen::CreateViews() {
 	// We normally use software rendering to debug so put it in debugging.
 	CheckBox *softwareGPU = graphicsSettings->Add(new CheckBox(&g_Config.bSoftwareRendering, gs->T("Software Rendering", "Software Rendering (experimental)")));
 	softwareGPU->OnClick.Handle(this, &GameSettingsScreen::OnSoftwareRendering);
-	if (PSP_IsInited())
+	if (PSP_IsInited() || g_Config.iGPUBackend != GPU_BACKEND_OPENGL)
 		softwareGPU->SetEnabled(false);
 
 	// Audio
@@ -364,6 +378,23 @@ void GameSettingsScreen::CreateViews() {
 #endif // #if defined(USING_WIN_UI)
 	controlsSettings->Add(new PopupSliderChoiceFloat(&g_Config.fAnalogLimiterDeadzone, 0.0f, 1.0f, c->T("Analog Limiter"), 0.10f, screenManager()));
 
+	ViewGroup *networkingSettingsScroll = new ScrollView(ORIENT_VERTICAL, new LinearLayoutParams(FILL_PARENT, FILL_PARENT));
+	LinearLayout *networkingSettings = new LinearLayout(ORIENT_VERTICAL);
+	networkingSettings->SetSpacing(0);
+	networkingSettingsScroll->Add(networkingSettings);
+	tabHolder->AddTab(s->T("Networking"), networkingSettingsScroll);  // TODO: This string was originally just an item header so in the wrong category
+
+	networkingSettings->Add(new ItemHeader(n->T("Networking")));
+	networkingSettings->Add(new CheckBox(&g_Config.bEnableWlan, n->T("Enable networking", "Enable networking/wlan (beta)")));
+
+#ifdef _WIN32
+	networkingSettings->Add(new PopupTextInputChoice(&g_Config.proAdhocServer, n->T("Change proAdhocServer Address"), "", 255, screenManager()));
+#else
+	networkingSettings->Add(new ChoiceWithValueDisplay(&g_Config.proAdhocServer, n->T("Change proAdhocServer Address"), nullptr))->OnClick.Handle(this, &GameSettingsScreen::OnChangeproAdhocServerAddress);
+#endif
+	networkingSettings->Add(new CheckBox(&g_Config.bEnableAdhocServer, n->T("Enable built-in PRO Adhoc Server", "Enable built-in PRO Adhoc Server")));
+	networkingSettings->Add(new ChoiceWithValueDisplay(&g_Config.sMACAddress, s->T("Change Mac Address"), nullptr))->OnClick.Handle(this, &GameSettingsScreen::OnChangeMacAddress);
+
 	// System
 	ViewGroup *systemSettingsScroll = new ScrollView(ORIENT_VERTICAL, new LinearLayoutParams(FILL_PARENT, FILL_PARENT));
 	LinearLayout *systemSettings = new LinearLayout(ORIENT_VERTICAL);
@@ -377,8 +408,11 @@ void GameSettingsScreen::CreateViews() {
 	systemSettings->Add(new ItemHeader(s->T("Emulation")));
 	systemSettings->Add(new CheckBox(&g_Config.bFastMemory, s->T("Fast Memory", "Fast Memory (Unstable)")))->OnClick.Handle(this, &GameSettingsScreen::OnJitAffectingSetting);
 
-	systemSettings->Add(new CheckBox(&g_Config.bSeparateCPUThread, s->T("Multithreaded (experimental)")))->SetEnabled(!PSP_IsInited());
+	systemSettings->Add(new CheckBox(&g_Config.bSeparateCPUThread, s->T("Multithreaded (experimental)")));
 	systemSettings->Add(new CheckBox(&g_Config.bSeparateIOThread, s->T("I/O on thread (experimental)")))->SetEnabled(!PSP_IsInited());
+	static const char *ioTimingMethods[] = { "Fast (lag on slow storage)", "Host (bugs, less lag)", "Simulate UMD delays" };
+	View *ioTimingMethod = systemSettings->Add(new PopupMultiChoice(&g_Config.iIOTimingMethod, s->T("IO timing method"), ioTimingMethods, 0, ARRAY_SIZE(ioTimingMethods), s, screenManager()));
+	ioTimingMethod->SetEnabledPtr(&g_Config.bSeparateIOThread);
 	systemSettings->Add(new CheckBox(&g_Config.bForceLagSync, s->T("Force real clock sync (slower, less lag)")));
 	systemSettings->Add(new PopupSliderChoice(&g_Config.iLockedCPUSpeed, 0, 1000, s->T("Change CPU Clock", "Change CPU Clock (0 = default) (unstable)"), screenManager()));
 #ifndef MOBILE_DEVICE
@@ -389,6 +423,56 @@ void GameSettingsScreen::CreateViews() {
 	systemSettings->Add(new CheckBox(&g_Config.bAtomicAudioLocks, s->T("Atomic Audio locks (experimental)")))->SetEnabled(!PSP_IsInited());
 #if defined(USING_WIN_UI)
 	systemSettings->Add(new CheckBox(&g_Config.bBypassOSKWithKeyboard, s->T("Enable Windows native keyboard", "Enable Windows native keyboard")));
+#endif
+#if defined(_WIN32)
+	SavePathInMyDocumentChoice = systemSettings->Add(new CheckBox(&installed_, s->T("Save path in My Documents", "Save path in My Documents")));
+	SavePathInMyDocumentChoice->OnClick.Handle(this, &GameSettingsScreen::OnSavePathMydoc);
+	SavePathInOtherChoice = systemSettings->Add(new CheckBox(&otherinstalled_, s->T("Save path in installed.txt", "Save path in installed.txt")));
+	SavePathInOtherChoice->SetEnabled(false);
+	SavePathInOtherChoice->OnClick.Handle(this, &GameSettingsScreen::OnSavePathOther);
+	wchar_t myDocumentsPath[MAX_PATH];
+	const HRESULT result = SHGetFolderPath(NULL, CSIDL_PERSONAL, NULL, SHGFP_TYPE_CURRENT, myDocumentsPath);
+	const std::string PPSSPPpath = File::GetExeDirectory();
+	const std::string installedFile = PPSSPPpath + "installed.txt";
+	const std::string path = File::GetExeDirectory();
+	installed_ = File::Exists(installedFile);
+	otherinstalled_ = false;
+	if (!installed_ && result == S_OK) {
+		if (File::CreateEmptyFile(PPSSPPpath + "installedTEMP.txt")) {
+			// Disable the setting whether cannot create & delete file
+			if (!(File::Delete(PPSSPPpath + "installedTEMP.txt")))
+				SavePathInMyDocumentChoice->SetEnabled(false);
+			else
+				SavePathInOtherChoice->SetEnabled(true);			
+		}
+		else
+			SavePathInMyDocumentChoice->SetEnabled(false);
+	}
+	else {
+		if (installed_ && (result == S_OK)) {
+			std::ifstream inputFile(ConvertUTF8ToWString(installedFile));
+			if (!inputFile.fail() && inputFile.is_open()) {
+				std::string tempString;
+				std::getline(inputFile, tempString);
+
+				// Skip UTF-8 encoding bytes if there are any. There are 3 of them.
+				if (tempString.substr(0, 3) == "\xEF\xBB\xBF")
+					tempString = tempString.substr(3);
+				SavePathInOtherChoice->SetEnabled(true);
+				if (!(tempString == "")) {
+					installed_ = false;
+					otherinstalled_ = true;
+				}
+			}
+			inputFile.close();
+		}
+		else if (result != S_OK)
+			SavePathInMyDocumentChoice->SetEnabled(false);
+	}	
+#endif
+
+#if defined(_M_X64)
+	systemSettings->Add(new CheckBox(&g_Config.bCacheFullIsoInRam, s->T("Cache ISO in RAM", "Cache full ISO in RAM (slow startup)")));
 #endif
 
 	systemSettings->Add(new ItemHeader(s->T("Developer Tools")));
@@ -412,17 +496,6 @@ void GameSettingsScreen::CreateViews() {
 	enableReportsCheckbox_ = new CheckBox(&enableReports_, s->T("Enable Compatibility Server Reports"));
 	enableReportsCheckbox_->SetEnabled(Reporting::IsSupported());
 	systemSettings->Add(enableReportsCheckbox_);
-
-	systemSettings->Add(new ItemHeader(s->T("Networking")));
-	systemSettings->Add(new CheckBox(&g_Config.bEnableWlan, s->T("Enable networking", "Enable networking/wlan (beta)")));
-
-#ifdef _WIN32
-	systemSettings->Add(new PopupTextInputChoice(&g_Config.proAdhocServer, s->T("Change proAdhocServer Address"), "", 255, screenManager()));
-#else
-	systemSettings->Add(new ChoiceWithValueDisplay(&g_Config.proAdhocServer, s->T("Change proAdhocServer Address"), nullptr))->OnClick.Handle(this, &GameSettingsScreen::OnChangeproAdhocServerAddress);
-#endif
-
-	systemSettings->Add(new ChoiceWithValueDisplay(&g_Config.sMACAddress, s->T("Change Mac Address"), nullptr))->OnClick.Handle(this, &GameSettingsScreen::OnChangeMacAddress);
 
 //#ifndef ANDROID
 	systemSettings->Add(new ItemHeader(s->T("Cheats", "Cheats (experimental, see forums)")));
@@ -514,6 +587,72 @@ UI::EventReturn GameSettingsScreen::OnJitAffectingSetting(UI::EventParams &e) {
 	return UI::EVENT_DONE;
 }
 
+#ifdef _WIN32
+
+UI::EventReturn GameSettingsScreen::OnSavePathMydoc(UI::EventParams &e) {
+	const std::string PPSSPPpath = File::GetExeDirectory();
+	const std::string installedFile = PPSSPPpath + "installed.txt";
+	const std::string path = File::GetExeDirectory();
+	installed_ = File::Exists(installedFile);
+	if (otherinstalled_) {
+		const std::string PPSSPPpath = File::GetExeDirectory();
+		File::Delete(PPSSPPpath + "installed.txt");
+		File::CreateEmptyFile(PPSSPPpath + "installed.txt");
+		otherinstalled_ = false;
+		wchar_t myDocumentsPath[MAX_PATH];
+		const HRESULT result = SHGetFolderPath(NULL, CSIDL_PERSONAL, NULL, SHGFP_TYPE_CURRENT, myDocumentsPath);
+		const std::string myDocsPath = ConvertWStringToUTF8(myDocumentsPath) + "/PPSSPP/";
+		g_Config.memStickDirectory = myDocsPath;
+	}
+	else if (installed_) {
+		File::Delete(PPSSPPpath + "installed.txt");
+		installed_ = false;
+		g_Config.memStickDirectory = PPSSPPpath + "memstick/";
+	}
+	else {
+		ofstream myfile;
+		myfile.open(PPSSPPpath + "installed.txt");
+		if (myfile.is_open()){
+			myfile.close();
+		}
+
+		wchar_t myDocumentsPath[MAX_PATH];
+		const HRESULT result = SHGetFolderPath(NULL, CSIDL_PERSONAL, NULL, SHGFP_TYPE_CURRENT, myDocumentsPath);
+		const std::string myDocsPath = ConvertWStringToUTF8(myDocumentsPath) + "/PPSSPP/";
+		g_Config.memStickDirectory = myDocsPath;
+		installed_ = true;
+	}
+	return UI::EVENT_DONE;
+}
+
+UI::EventReturn GameSettingsScreen::OnSavePathOther(UI::EventParams &e) {
+	const std::string PPSSPPpath = File::GetExeDirectory();	
+	if (otherinstalled_) {
+		I18NCategory *di = GetI18NCategory("Dialog");
+		std::string folder = W32Util::BrowseForFolder(MainWindow::GetHWND(), di->T("Choose PPSSPP save folder"));
+		if (folder.size()) {
+			ofstream myfile;
+			g_Config.memStickDirectory = folder;
+			myfile.open(PPSSPPpath + "installed.txt");
+			myfile << "\xEF\xBB\xBF" + folder;
+			myfile.close();
+			installed_ = false;
+		}
+		else
+			otherinstalled_ = false;
+	}
+	else {
+		File::Delete(PPSSPPpath + "installed.txt");
+		SavePathInMyDocumentChoice->SetEnabled(true);
+		otherinstalled_ = false;
+		installed_ = false;
+		g_Config.memStickDirectory = PPSSPPpath + "memstick/";
+	}
+	return UI::EVENT_DONE;
+}
+
+#endif
+
 UI::EventReturn GameSettingsScreen::OnClearRecents(UI::EventParams &e) {
 	g_Config.recentIsos.clear();
 	OnRecentChanged.Trigger(e);
@@ -598,6 +737,10 @@ void GameSettingsScreen::onFinish(DialogResult result) {
 	Reporting::Enable(enableReports_, "report.ppsspp.org");
 	Reporting::UpdateConfig();
 	g_Config.Save();
+	if (bEditThenRestore)
+	{
+		g_Config.unloadGameConfig();
+	}
 
 	host->UpdateUI();
 
@@ -800,9 +943,18 @@ void GameSettingsScreen::CallbackRestoreDefaults(bool yes) {
 UI::EventReturn GameSettingsScreen::OnRestoreDefaultSettings(UI::EventParams &e) {
 	I18NCategory *de = GetI18NCategory("Developer");
 	I18NCategory *d = GetI18NCategory("Dialog");
-	screenManager()->push(
-		new PromptScreen(de->T("RestoreDefaultSettings", "Are you sure you want to restore all settings(except control mapping)\nback to their defaults?\nYou can't undo this.\nPlease restart PPSSPP after restoring settings."), d->T("OK"), d->T("Cancel"),
-	std::bind(&GameSettingsScreen::CallbackRestoreDefaults, this, placeholder::_1)));
+	if (g_Config.bGameSpecific)
+	{
+		screenManager()->push(
+			new PromptScreen(de->T("RestoreGameDefaultSettings", "Are you sure you want to restore the game-specific settings back to the ppsspp defaults?\n"), d->T("OK"), d->T("Cancel"),
+			std::bind(&GameSettingsScreen::CallbackRestoreDefaults, this, placeholder::_1)));
+	}
+	else
+	{
+		screenManager()->push(
+			new PromptScreen(de->T("RestoreDefaultSettings", "Are you sure you want to restore all settings(except control mapping)\nback to their defaults?\nYou can't undo this.\nPlease restart PPSSPP after restoring settings."), d->T("OK"), d->T("Cancel"),
+			std::bind(&GameSettingsScreen::CallbackRestoreDefaults, this, placeholder::_1)));
+	}
 
 	return UI::EVENT_DONE;
 }
